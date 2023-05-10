@@ -1,5 +1,6 @@
-use std::{env, process, thread, time::Duration};
-use mqtt::{MessageBuilder, PropertyCode};
+use std::{error::Error, env, fmt, process, thread, time::Duration};
+use mqtt::{Message, MessageBuilder, PropertyCode};
+use serde::{Deserialize, Serialize};
 
 extern crate paho_mqtt as mqtt;
 
@@ -7,6 +8,27 @@ const DFLT_BROKER: &str = "tcp://localhost:1883";
 const DFLT_CLIENT: &str = "rust_responder";
 const DFLT_TOPIC: &str = &"rust/req";
 const DFLT_QOS: i32 = 1;
+
+#[derive(Debug, Deserialize, Serialize)]
+struct Request {
+    value: String,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+struct Response {
+    result: String,
+}
+
+#[derive(Debug, Clone)]
+struct NoResponseTopicError;
+
+impl fmt::Display for NoResponseTopicError {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        write!(f, "No response topic was provided")
+    }
+}
+
+impl Error for NoResponseTopicError {}
 
 // Reconnect to the broker when connection is lost.
 fn try_reconnect(cli: &mqtt::Client) -> bool
@@ -28,6 +50,34 @@ fn subscribe_topic(cli: &mqtt::Client) {
         println!("Error subscribing topic: {:?}", e);
         process::exit(1);
     }
+}
+
+fn handle_request(req: Request) -> Response {
+    Response {
+        result: req.value.chars().rev().collect()
+    }
+}
+
+fn try_respond(cli: &mqtt::Client, req: &Message) -> Result<(), Box<dyn Error>> {
+    let topic = req.properties()
+        .get_string(PropertyCode::ResponseTopic).ok_or(NoResponseTopicError)?;
+    let request: Request = serde_json::from_str(&req.payload_str())?;
+    let response_payload = serde_json::to_string(&handle_request(request))?;
+    let mut props = mqtt::Properties::new();
+    if let Some(cd) = req.properties()
+        .get_binary(PropertyCode::CorrelationData) {
+        props.push_binary(PropertyCode::CorrelationData, cd.clone())?;
+    }
+    let resp =
+        MessageBuilder::new()
+            .topic(topic)
+            .payload(response_payload)
+            .qos(DFLT_QOS)
+            .properties(props)
+            .finalize();
+    cli.publish(resp)?;
+
+    Ok(())
 }
 
 fn main() {
@@ -75,23 +125,8 @@ fn main() {
     println!("Processing requests...");
     for msg in rx.iter() {
         if let Some(msg) = msg {
-            if let Some(topic) = msg.properties()
-                .get_string(PropertyCode::ResponseTopic) {
-                let mut props = mqtt::Properties::new();
-                if let Some(cd) = msg.properties()
-                    .get_binary(PropertyCode::CorrelationData) {
-                    props.push_binary(PropertyCode::CorrelationData, cd.clone()).unwrap();
-                }
-                let resp =
-                    MessageBuilder::new()
-                        .topic(topic)
-                        .payload(msg.payload())
-                        .qos(DFLT_QOS)
-                        .properties(props)
-                        .finalize();
-                cli.publish(resp).unwrap();
-            } else {
-                println!("No Response topic - ignoring request");
+            if let Err(e) = try_respond(&cli, &msg) {
+                println!("Unable to handle request:\n\t{}", e);
             }
         } else if !cli.is_connected() {
             if try_reconnect(&cli) {

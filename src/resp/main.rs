@@ -1,6 +1,9 @@
-use std::{error::Error, env, fmt, process, thread, time::Duration};
+mod logic;
+
+use logic::*;
 use mqtt::{Message, MessageBuilder, PropertyCode, Receiver};
 use serde::{Deserialize, Serialize};
+use std::{env, error::Error, fmt, process, thread, time::Duration};
 
 extern crate paho_mqtt as mqtt;
 
@@ -10,22 +13,13 @@ const REQ_TOPIC: &str = &"rust/req";
 const NOTIFY_TOPIC: &str = &"rust/notify";
 const DEFAULT_QOS: i32 = 1;
 
-#[derive(Debug, Deserialize, Serialize)]
-struct Request {
-    value: String,
-}
-
-#[derive(Debug, Deserialize, Serialize)]
-struct Response {
-    result: String,
-}
-
 #[derive(Debug, Serialize, Deserialize)]
-enum Notification {
+pub enum Notification {
     Responded { topic: String, count: usize },
     Ignored { error: String, count: usize },
 }
 
+/// Error type for "received a request without a response-topic"
 #[derive(Debug, Clone)]
 struct NoResponseTopicError;
 
@@ -38,8 +32,7 @@ impl fmt::Display for NoResponseTopicError {
 impl Error for NoResponseTopicError {}
 
 // Reconnect to the broker when connection is lost.
-fn try_reconnect(cli: &mqtt::Client) -> bool
-{
+fn try_reconnect(cli: &mqtt::Client) -> bool {
     println!("Connection lost. Waiting to retry connection");
     for _ in 0..12 {
         thread::sleep(Duration::from_millis(5000));
@@ -52,68 +45,72 @@ fn try_reconnect(cli: &mqtt::Client) -> bool
     false
 }
 
-fn subscribe_topic(cli: &mqtt::Client) {
+fn subscribe_request_topic(cli: &mqtt::Client) {
     if let Err(e) = cli.subscribe(REQ_TOPIC, DEFAULT_QOS) {
         println!("Error subscribing topic: {:?}", e);
         process::exit(1);
     }
 }
 
-fn handle_request(req: Request) -> Response {
-    Response {
-        result: req.value.chars().rev().collect()
-    }
-}
-
-fn publish_notification(cli: &mqtt::Client, notification: &Notification) -> Result<(), Box<dyn Error>> {
+fn publish_notification(
+    cli: &mqtt::Client,
+    notification: &Notification,
+) -> Result<(), Box<dyn Error>> {
     let payload = serde_json::to_string(notification)?;
-    let resp =
-        MessageBuilder::new()
-            .topic(NOTIFY_TOPIC)
-            .payload(payload)
-            .qos(DEFAULT_QOS)
-            .finalize();
+    let resp = MessageBuilder::new()
+        .topic(NOTIFY_TOPIC)
+        .payload(payload)
+        .qos(DEFAULT_QOS)
+        .finalize();
     cli.publish(resp).map_err(|e| e.into())
 }
 
 fn response_properties(msg: &Message) -> mqtt::errors::Result<mqtt::Properties> {
-    if let Some(cd) = msg.properties()
-        .get_binary(PropertyCode::CorrelationData) {
+    if let Some(cd) = msg.properties().get_binary(PropertyCode::CorrelationData) {
         let mut props = mqtt::Properties::new();
-        props.push_binary(PropertyCode::CorrelationData, cd).map(|_| props)
+        props
+            .push_binary(PropertyCode::CorrelationData, cd)
+            .map(|_| props)
     } else {
         Ok(mqtt::Properties::new())
     }
 }
 
-fn try_respond(cli: &mqtt::Client, req: &Message) -> Result<String, Box<dyn Error>> {
-    let topic = req.properties()
-        .get_string(PropertyCode::ResponseTopic).ok_or(NoResponseTopicError)?;
-    let request: Request = serde_json::from_str(&req.payload_str())?;
-    let response_payload = serde_json::to_string(&handle_request(request))?;
+/// Generic request-handler.
+///
+/// Extracts the payload from `req`, passed it to the `logic` and publishes the returned `O` as
+/// response.
+fn respond_generic<I: for<'de> Deserialize<'de>, O: Serialize, F: Fn(I) -> O>(
+    cli: &mqtt::Client,
+    req: &Message,
+    logic: F,
+) -> Result<String, Box<dyn Error>> {
+    let topic = req
+        .properties()
+        .get_string(PropertyCode::ResponseTopic)
+        .ok_or(NoResponseTopicError)?;
+    let request: I = serde_json::from_str(&req.payload_str())?;
+    let response_payload = serde_json::to_string(&logic(request))?;
     let props = response_properties(req)?;
-    let resp =
-        MessageBuilder::new()
-            .topic(topic.clone())
-            .payload(response_payload)
-            .qos(DEFAULT_QOS)
-            .properties(props)
-            .finalize();
+    let resp = MessageBuilder::new()
+        .topic(topic.clone())
+        .payload(response_payload)
+        .qos(DEFAULT_QOS)
+        .properties(props)
+        .finalize();
     cli.publish(resp)?;
 
     Ok(topic)
 }
 
 fn main() {
-    let host = env::args().nth(1).unwrap_or_else(||
-        DEFAULT_BROKER.to_string()
-    );
-
+    let host = env::args()
+        .nth(1)
+        .unwrap_or_else(|| DEFAULT_BROKER.to_string());
 
     // Create a client.
     let cli = {
         // Define the set of options for the create.
-        // Use an ID for a persistent session.
         let create_opts = mqtt::CreateOptionsBuilder::new()
             .server_uri(host)
             .mqtt_version(mqtt::MQTT_VERSION_5)
@@ -149,22 +146,27 @@ fn main() {
     }
 
     // Subscribe request-topic.
-    subscribe_topic(&cli);
+    subscribe_request_topic(&cli);
 
     println!("Processing requests...");
     for (i, msg) in rx.iter().enumerate() {
         if let Some(msg) = msg {
-            let notification =
-                try_respond(&cli, &msg)
-                    .map(|t| Notification::Responded { topic: t, count: i })
-                    .unwrap_or_else(|e| Notification::Ignored { error: format!("{}", e), count: i });
+            let notification = respond_generic(&cli, &msg, handle_request)
+                .map(|t| Notification::Responded { topic: t, count: i })
+                .unwrap_or_else(|e| Notification::Ignored {
+                    error: format!("{}", e),
+                    count: i,
+                });
             if let Err(e) = publish_notification(&cli, &notification) {
-                println!("Failed to publish this Notification: {:?}\n\tError: {:?}", notification, e);
+                println!(
+                    "Failed to publish this Notification: {:?}\n\tError: {:?}",
+                    notification, e
+                );
             }
         } else if !cli.is_connected() {
             if try_reconnect(&cli) {
                 println!("Resubscribe topics...");
-                subscribe_topic(&cli);
+                subscribe_request_topic(&cli);
             } else {
                 break;
             }

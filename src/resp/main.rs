@@ -103,6 +103,27 @@ fn respond_generic<I: for<'de> Deserialize<'de>, O: Serialize, F: Fn(I) -> O>(
     Ok(topic)
 }
 
+fn fix_types<I: for<'de> Deserialize<'de>, O: Serialize, F: Fn(I) -> O + Copy>(
+    logic: F,
+) -> impl Fn(&mqtt::Client, &Message) -> Result<String, Box<dyn Error>> {
+    move |cli, req| respond_generic(cli, req, logic)
+}
+
+fn fallback_handler() -> impl Fn(&mqtt::Client, &Message) -> Result<String, Box<dyn Error>> {
+    |_cli, _req| Err(NoResponseTopicError).map_err(|e| e.into())
+}
+
+type BoxedRequestHandler = Box<dyn Fn(&mqtt::Client, &Message) -> Result<String, Box<dyn Error>>>;
+
+fn handler_for_topic(
+    topic: &str,
+) -> BoxedRequestHandler {
+    match topic {
+        REQ_TOPIC => Box::new(fix_types(&handle_request)),
+        _ => Box::new(fallback_handler()),
+    }
+}
+
 fn main() {
     let host = env::args()
         .nth(1)
@@ -151,7 +172,7 @@ fn main() {
     println!("Processing requests...");
     for (i, msg) in rx.iter().enumerate() {
         if let Some(msg) = msg {
-            let notification = respond_generic(&cli, &msg, handle_request)
+            let notification = handler_for_topic(msg.topic())(&cli, &msg)
                 .map(|t| Notification::Responded { topic: t, count: i })
                 .unwrap_or_else(|e| Notification::Ignored {
                     error: format!("{}", e),

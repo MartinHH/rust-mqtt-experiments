@@ -1,16 +1,18 @@
+mod handler;
 mod logic;
 
+use handler::*;
 use logic::*;
-use mqtt::{Message, MessageBuilder, PropertyCode, Receiver};
+
+use mqtt::{Message, MessageBuilder, Receiver};
 use serde::{Deserialize, Serialize};
-use std::{env, error::Error, fmt, process, thread, time::Duration};
+use std::collections::HashMap;
+use std::{env, error::Error, process, thread, time::Duration};
 
 extern crate paho_mqtt as mqtt;
 
 const DEFAULT_BROKER: &str = "tcp://localhost:1883";
 const DEFAULT_CLIENT: &str = "rust_responder";
-const REQ_TOPIC: &str = &"rust/req";
-const NOTIFY_TOPIC: &str = &"rust/notify";
 const DEFAULT_QOS: i32 = 1;
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -18,18 +20,6 @@ pub enum Notification {
     Responded { topic: String, count: usize },
     Ignored { error: String, count: usize },
 }
-
-/// Error type for "received a request without a response-topic"
-#[derive(Debug, Clone)]
-struct NoResponseTopicError;
-
-impl fmt::Display for NoResponseTopicError {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        write!(f, "No response topic was provided")
-    }
-}
-
-impl Error for NoResponseTopicError {}
 
 // Reconnect to the broker when connection is lost.
 fn try_reconnect(cli: &mqtt::Client) -> bool {
@@ -45,89 +35,28 @@ fn try_reconnect(cli: &mqtt::Client) -> bool {
     false
 }
 
-fn subscribe_request_topic(cli: &mqtt::Client) {
-    if let Err(e) = cli.subscribe(REQ_TOPIC, DEFAULT_QOS) {
-        println!("Error subscribing topic: {:?}", e);
-        process::exit(1);
+fn subscribe(cli: &mqtt::Client, handlers: &MessageHandlersMap) -> Result<(), Box<dyn Error>> {
+    for t in handlers.keys() {
+        cli.subscribe(t, DEFAULT_QOS)?;
     }
+    Ok(())
 }
 
-fn publish_notification(
-    cli: &mqtt::Client,
-    notification: &Notification,
-) -> Result<(), Box<dyn Error>> {
-    let payload = serde_json::to_string(notification)?;
-    let resp = MessageBuilder::new()
-        .topic(NOTIFY_TOPIC)
-        .payload(payload)
-        .qos(DEFAULT_QOS)
-        .finalize();
-    cli.publish(resp).map_err(|e| e.into())
-}
-
-fn response_properties(msg: &Message) -> mqtt::errors::Result<mqtt::Properties> {
-    if let Some(cd) = msg.properties().get_binary(PropertyCode::CorrelationData) {
-        let mut props = mqtt::Properties::new();
-        props
-            .push_binary(PropertyCode::CorrelationData, cd)
-            .map(|_| props)
-    } else {
-        Ok(mqtt::Properties::new())
-    }
-}
-
-/// Generic request-handler.
-///
-/// Extracts the payload from `req`, passed it to the `logic` and publishes the returned `O` as
-/// response.
-fn respond_generic<I: for<'de> Deserialize<'de>, O: Serialize, F: Fn(I) -> O>(
-    cli: &mqtt::Client,
-    req: &Message,
-    logic: F,
-) -> Result<String, Box<dyn Error>> {
-    let topic = req
-        .properties()
-        .get_string(PropertyCode::ResponseTopic)
-        .ok_or(NoResponseTopicError)?;
-    let request: I = serde_json::from_str(&req.payload_str())?;
-    let response_payload = serde_json::to_string(&logic(request))?;
-    let props = response_properties(req)?;
-    let resp = MessageBuilder::new()
-        .topic(topic.clone())
-        .payload(response_payload)
-        .qos(DEFAULT_QOS)
-        .properties(props)
-        .finalize();
-    cli.publish(resp)?;
-
-    Ok(topic)
-}
-
-fn fix_types<I: for<'de> Deserialize<'de>, O: Serialize, F: Fn(I) -> O + Copy>(
-    logic: F,
-) -> impl Fn(&mqtt::Client, &Message) -> Result<String, Box<dyn Error>> {
-    move |cli, req| respond_generic(cli, req, logic)
-}
-
-fn fallback_handler() -> impl Fn(&mqtt::Client, &Message) -> Result<String, Box<dyn Error>> {
-    |_cli, _req| Err(NoResponseTopicError).map_err(|e| e.into())
-}
-
-type BoxedRequestHandler = Box<dyn Fn(&mqtt::Client, &Message) -> Result<String, Box<dyn Error>>>;
-
-fn handler_for_topic(
-    topic: &str,
-) -> BoxedRequestHandler {
-    match topic {
-        REQ_TOPIC => Box::new(fix_types(&handle_request)),
-        _ => Box::new(fallback_handler()),
-    }
+fn handlers_map<'a>() -> MessageHandlersMap<'a> {
+    let mut m: MessageHandlersMap = HashMap::new();
+    m.insert("rust/reverse", responding_handler(reverse));
+    m.insert("rust/add", responding_handler(add));
+    m.insert("rust/sub", responding_handler(sub));
+    m
 }
 
 fn main() {
     let host = env::args()
         .nth(1)
         .unwrap_or_else(|| DEFAULT_BROKER.to_string());
+
+    let handlers = handlers_map();
+    let fallback_handler = no_such_topic_handler();
 
     // Create a client.
     let cli = {
@@ -166,28 +95,25 @@ fn main() {
         process::exit(1);
     }
 
-    // Subscribe request-topic.
-    subscribe_request_topic(&cli);
+    if let Err(e) = subscribe(&cli, &handlers) {
+        println!("Error subscribing topics: {:?}", e);
+        process::exit(1);
+    }
 
     println!("Processing requests...");
-    for (i, msg) in rx.iter().enumerate() {
+    for msg in rx.iter() {
         if let Some(msg) = msg {
-            let notification = handler_for_topic(msg.topic())(&cli, &msg)
-                .map(|t| Notification::Responded { topic: t, count: i })
-                .unwrap_or_else(|e| Notification::Ignored {
-                    error: format!("{}", e),
-                    count: i,
-                });
-            if let Err(e) = publish_notification(&cli, &notification) {
-                println!(
-                    "Failed to publish this Notification: {:?}\n\tError: {:?}",
-                    notification, e
-                );
+            let handler: &MessageHandler = handlers.get(msg.topic()).unwrap_or(&fallback_handler);
+            if let Err(e) = handler(&cli, &msg) {
+                println!("Error handling message on topic {:?}: {:?}", msg.topic(), e);
             }
         } else if !cli.is_connected() {
             if try_reconnect(&cli) {
                 println!("Resubscribe topics...");
-                subscribe_request_topic(&cli);
+                if let Err(e) = subscribe(&cli, &handlers) {
+                    println!("Error subscribing topics: {:?}", e);
+                    process::exit(1);
+                }
             } else {
                 break;
             }
@@ -197,7 +123,8 @@ fn main() {
     // If still connected, then disconnect now.
     if cli.is_connected() {
         println!("Disconnecting");
-        cli.unsubscribe(REQ_TOPIC).unwrap();
+        // TODO: unsubscribe
+        //cli.unsubscribe(REQ_TOPIC).unwrap();
         cli.disconnect(None).unwrap();
     }
     println!("Exiting");

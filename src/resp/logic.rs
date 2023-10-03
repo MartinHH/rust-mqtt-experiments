@@ -1,17 +1,17 @@
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Deserialize, Serialize)]
+pub struct Response<R> {
+    result: R,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
 pub struct ReverseRequest {
     value: String,
 }
 
-#[derive(Debug, Deserialize, Serialize)]
-pub struct StringResponse {
-    result: String,
-}
-
-pub fn reverse(req: ReverseRequest) -> StringResponse {
-    StringResponse {
+pub fn reverse(req: ReverseRequest) -> Response<String> {
+    Response {
         result: req.value.chars().rev().collect(),
     }
 }
@@ -22,19 +22,14 @@ pub struct CalcRequest {
     y: i32,
 }
 
-#[derive(Debug, Deserialize, Serialize)]
-pub struct CalcResponse {
-    result: i32,
-}
-
-pub fn add(req: CalcRequest) -> CalcResponse {
-    CalcResponse {
+pub fn add(req: CalcRequest) -> Response<i32> {
+    Response {
         result: req.x + req.y,
     }
 }
 
-pub fn sub(req: CalcRequest) -> CalcResponse {
-    CalcResponse {
+pub fn sub(req: CalcRequest) -> Response<i32> {
+    Response {
         result: req.x - req.y,
     }
 }

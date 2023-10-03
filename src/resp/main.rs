@@ -5,7 +5,6 @@ use handler::*;
 use logic::*;
 
 use mqtt::{Message, MessageBuilder, Receiver};
-use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::{env, error::Error, process, thread, time::Duration};
 
@@ -14,12 +13,6 @@ extern crate paho_mqtt as mqtt;
 const DEFAULT_BROKER: &str = "tcp://localhost:1883";
 const DEFAULT_CLIENT: &str = "rust_responder";
 const DEFAULT_QOS: i32 = 1;
-
-#[derive(Debug, Serialize, Deserialize)]
-pub enum Notification {
-    Responded { topic: String, count: usize },
-    Ignored { error: String, count: usize },
-}
 
 // Reconnect to the broker when connection is lost.
 fn try_reconnect(cli: &mqtt::Client) -> bool {
@@ -42,11 +35,11 @@ fn subscribe(cli: &mqtt::Client, handlers: &MessageHandlersMap) -> Result<(), Bo
     Ok(())
 }
 
-fn handlers_map<'a>() -> MessageHandlersMap<'a> {
+fn handlers_map() -> MessageHandlersMap {
     let mut m: MessageHandlersMap = HashMap::new();
-    m.insert("rust/reverse", responding_handler(reverse));
-    m.insert("rust/add", responding_handler(add));
-    m.insert("rust/sub", responding_handler(sub));
+    m.insert(String::from("rust/reverse"), responding_handler(reverse));
+    m.insert(String::from("rust/add"), responding_handler(add));
+    m.insert(String::from("rust/sub"), responding_handler(sub));
     m
 }
 
@@ -59,7 +52,7 @@ fn main() {
     let fallback_handler = no_such_topic_handler();
 
     // Create a client.
-    let cli = {
+    let client = {
         // Define the set of options for the create.
         let create_opts = mqtt::CreateOptionsBuilder::new()
             .server_uri(host)
@@ -74,7 +67,7 @@ fn main() {
     };
 
     // Initialize the consumer before connecting.
-    let rx: Receiver<Option<Message>> = cli.start_consuming();
+    let rx: Receiver<Option<Message>> = client.start_consuming();
 
     // Define the set of options for the connection.
     let conn_opts = {
@@ -90,12 +83,12 @@ fn main() {
     };
 
     // Connect and wait for it to complete or fail.
-    if let Err(e) = cli.connect(conn_opts) {
+    if let Err(e) = client.connect(conn_opts) {
         println!("Unable to connect:\n\t{:?}", e);
         process::exit(1);
     }
 
-    if let Err(e) = subscribe(&cli, &handlers) {
+    if let Err(e) = subscribe(&client, &handlers) {
         println!("Error subscribing topics: {:?}", e);
         process::exit(1);
     }
@@ -104,13 +97,13 @@ fn main() {
     for msg in rx.iter() {
         if let Some(msg) = msg {
             let handler: &MessageHandler = handlers.get(msg.topic()).unwrap_or(&fallback_handler);
-            if let Err(e) = handler(&cli, &msg) {
+            if let Err(e) = handler(&client, &msg) {
                 println!("Error handling message on topic {:?}: {:?}", msg.topic(), e);
             }
-        } else if !cli.is_connected() {
-            if try_reconnect(&cli) {
+        } else if !client.is_connected() {
+            if try_reconnect(&client) {
                 println!("Resubscribe topics...");
-                if let Err(e) = subscribe(&cli, &handlers) {
+                if let Err(e) = subscribe(&client, &handlers) {
                     println!("Error subscribing topics: {:?}", e);
                     process::exit(1);
                 }
@@ -121,11 +114,11 @@ fn main() {
     }
 
     // If still connected, then disconnect now.
-    if cli.is_connected() {
+    if client.is_connected() {
         println!("Disconnecting");
         // TODO: unsubscribe
         //cli.unsubscribe(REQ_TOPIC).unwrap();
-        cli.disconnect(None).unwrap();
+        client.disconnect(None).unwrap();
     }
     println!("Exiting");
 }

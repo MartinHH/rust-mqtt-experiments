@@ -116,8 +116,10 @@ fn main() {
     // If still connected, then disconnect now.
     if client.is_connected() {
         println!("Disconnecting");
-        // TODO: unsubscribe
-        //cli.unsubscribe(REQ_TOPIC).unwrap();
+        handlers
+            .keys()
+            .try_fold((), |_acc, topic| client.unsubscribe(topic))
+            .unwrap();
         client.disconnect(None).unwrap();
     }
     println!("Exiting");

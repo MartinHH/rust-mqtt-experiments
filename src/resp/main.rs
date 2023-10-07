@@ -6,7 +6,9 @@ use logic::*;
 
 use mqtt::{Message, MessageBuilder, Receiver};
 use std::collections::HashMap;
-use std::{env, error::Error, process, thread, time::Duration};
+use std::{env, error::Error, io, process, thread, time::Duration};
+
+use crossbeam_channel::bounded;
 
 extern crate paho_mqtt as mqtt;
 
@@ -43,13 +45,17 @@ fn handlers_map() -> MessageHandlersMap {
     m
 }
 
+fn wait_for_enter_pressed() -> io::Result<()> {
+    // there's probably a more elegant way, but this will do for now:
+    let stdin = io::stdin();
+    let mut buf = String::new();
+    stdin.read_line(&mut buf).map(|_|{()})
+}
+
 fn main() {
     let host = env::args()
         .nth(1)
         .unwrap_or_else(|| DEFAULT_BROKER.to_string());
-
-    let handlers = handlers_map();
-    let fallback_handler = no_such_topic_handler();
 
     // Create a client.
     let client = {
@@ -88,39 +94,56 @@ fn main() {
         process::exit(1);
     }
 
-    if let Err(e) = subscribe(&client, &handlers) {
-        println!("Error subscribing topics: {:?}", e);
-        process::exit(1);
-    }
+    let (s_abort, r_abort) = bounded(1);
 
-    println!("Processing requests...");
-    for msg in rx.iter() {
-        if let Some(msg) = msg {
-            let handler: &MessageHandler = handlers.get(msg.topic()).unwrap_or(&fallback_handler);
-            if let Err(e) = handler(&client, &msg) {
-                println!("Error handling message on topic {:?}: {:?}", msg.topic(), e);
-            }
-        } else if !client.is_connected() {
-            if try_reconnect(&client) {
-                println!("Resubscribe topics...");
-                if let Err(e) = subscribe(&client, &handlers) {
-                    println!("Error subscribing topics: {:?}", e);
-                    process::exit(1);
+    let join_handler = thread::spawn(move || {
+        let handlers = handlers_map();
+        let fallback_handler = no_such_topic_handler();
+
+        if let Err(e) = subscribe(&client, &handlers) {
+            println!("Error subscribing topics: {:?}", e);
+            process::exit(1);
+        }
+        println!("Processing requests...");
+
+        while let Err(_) = r_abort.try_recv() {
+            let msg = rx.recv_timeout(Duration::from_millis(500));
+            if let Ok(msg_opt) = msg {
+                if let Some(msg) = msg_opt {
+                    let handler: &MessageHandler =
+                        handlers.get(msg.topic()).unwrap_or(&fallback_handler);
+                    if let Err(e) = handler(&client, &msg) {
+                        println!("Error handling message on topic {:?}: {:?}", msg.topic(), e);
+                    }
+                } else if !client.is_connected() {
+                    if try_reconnect(&client) {
+                        println!("Resubscribe topics...");
+                        if let Err(e) = subscribe(&client, &handlers) {
+                            println!("Error subscribing topics: {:?}", e);
+                            process::exit(1);
+                        }
+                    } else {
+                        break;
+                    }
                 }
-            } else {
-                break;
             }
         }
-    }
 
-    // If still connected, then disconnect now.
-    if client.is_connected() {
-        println!("Disconnecting");
-        handlers
-            .keys()
-            .try_fold((), |_acc, topic| client.unsubscribe(topic))
-            .unwrap();
-        client.disconnect(None).unwrap();
-    }
+        // If still connected, then disconnect now.
+        if client.is_connected() {
+            println!("Disconnecting");
+            handlers
+                .keys()
+                .try_fold((), |_acc, topic| client.unsubscribe(topic))
+                .unwrap();
+            client.disconnect(None).unwrap();
+        }
+    });
+
+    wait_for_enter_pressed().unwrap();
+    s_abort.send(()).unwrap();
+
+    join_handler.join().unwrap();
+
     println!("Exiting");
 }
